@@ -4,6 +4,7 @@
 from collections.abc import Iterable
 from datetime import timedelta
 from functools import cached_property, lru_cache
+from typing import Any
 
 import frappe
 import frappe.defaults
@@ -18,10 +19,11 @@ from frappe.desk.doctype.notification_settings.notification_settings import (
 	toggle_notifications,
 )
 from frappe.desk.notifications import clear_notifications
-from frappe.model.document import Document
+from frappe.model.document import Document, get_controller
 from frappe.query_builder import DocType
 from frappe.rate_limiter import rate_limit
 from frappe.sessions import clear_sessions
+from frappe.twofactor import should_run_2fa
 from frappe.utils import (
 	cint,
 	escape_html,
@@ -50,6 +52,9 @@ desk_properties = (
 	"form_navigation_buttons",
 	"timeline",
 	"dashboard",
+	"report_split_view",
+	"show_my_space",
+	"dock_mode",
 )
 
 
@@ -86,6 +91,7 @@ class User(Document):
 		defaults: DF.Table[DefaultValue]
 		desk_theme: DF.Literal["Light", "Dark", "Automatic"]
 		document_follow_frequency: DF.Literal["Hourly", "Daily", "Weekly"]
+		dock_mode: DF.Literal["Floating", "Pinned"]
 		document_follow_notify: DF.Check
 		email: DF.Data
 		email_signature: DF.TextEditor | None
@@ -124,6 +130,7 @@ class User(Document):
 		onboarding_status: DF.SmallText | None
 		phone: DF.Data | None
 		redirect_url: DF.SmallText | None
+		report_split_view: DF.Check
 		reset_password_key: DF.Data | None
 		restrict_ip: DF.SmallText | None
 		role_profile_name: DF.Link | None
@@ -131,8 +138,10 @@ class User(Document):
 		roles: DF.Table[HasRole]
 		search_bar: DF.Check
 		send_me_a_copy: DF.Check
+		send_read_receipt: DF.Check
 		send_welcome_email: DF.Check
 		show_absolute_datetime_in_timeline: DF.Check
+		show_my_space: DF.Check
 		simultaneous_sessions: DF.Int
 		social_logins: DF.Table[UserSocialLogin]
 		thread_notify: DF.Check
@@ -196,9 +205,14 @@ class User(Document):
 			self.name = self.email
 
 	def onload(self):
-		from frappe.utils.modules import get_modules_from_all_apps
+		from frappe.utils.modules import get_blockable_module_names
 
-		self.set_onload("all_modules", sorted(m.get("module_name") for m in get_modules_from_all_apps()))
+		if not self.has_permlevel_access_to("block_modules", permission_type="write"):
+			return
+
+		self.set_onload(
+			"all_modules", get_blockable_module_names(blocked=[d.module for d in self.block_modules])
+		)
 
 	def before_insert(self):
 		self.flags.in_insert = True
@@ -280,11 +294,7 @@ class User(Document):
 		"""This handles old role_profile_name field if programatically set.
 
 		This behaviour will be removed in future versions."""
-		if not self.role_profiles:
-			self.role_profile_name = None
-			return
-
-		if not self.role_profile_name:
+		if not self.role_profile_name or not self.has_value_changed("role_profile_name"):
 			return
 
 		current_role_profiles = {r.role_profile for r in self.role_profiles}
@@ -351,7 +361,7 @@ class User(Document):
 		if self.has_value_changed("enabled"):
 			frappe.cache.delete_key("users_for_mentions")
 			frappe.cache.delete_key("enabled_users")
-		elif self.has_value_changed("allow_in_mentions") or self.has_value_changed("user_type"):
+		elif self.has_value_changed("allowed_in_mentions") or self.has_value_changed("user_type"):
 			frappe.cache.delete_key("users_for_mentions")
 
 		if self.has_value_changed("user_type"):
@@ -508,15 +518,20 @@ class User(Document):
 	def password_reset_mail(self, link):
 		reset_password_template = frappe.db.get_system_setting("reset_password_template")
 
+		expiry_seconds = cint(frappe.get_system_settings("reset_password_link_expiry_duration"))
+		expiry_minutes = (expiry_seconds // 60) or None
+
 		self.send_login_mail(
 			_("Password Reset"),
 			"password_reset",
-			{"link": link},
+			{"link": link, "expiry_minutes": expiry_minutes},
 			now=True,
 			custom_template=reset_password_template,
+			wrapper=None if reset_password_template else "templates/emails/auth_email.html",
 		)
 
 	def send_welcome_mail_to_user(self):
+		from frappe.email.email_body import get_brand_name
 		from frappe.utils import get_url
 
 		link = self._reset_password()
@@ -539,12 +554,17 @@ class User(Document):
 			dict(
 				link=link,
 				site_url=get_url(),
+				app_name=get_brand_name() or "Frappe",
 			),
 			custom_template=welcome_email_template,
+			wrapper=None if welcome_email_template else "templates/emails/auth_email.html",
 		)
 
-	def send_login_mail(self, subject, template, add_args, now=None, custom_template=None):
+	def send_login_mail(self, subject, template, add_args, now=None, custom_template=None, wrapper=None):
 		"""send mail with login details"""
+		if not self.enabled:
+			return
+
 		from frappe.utils import get_url
 		from frappe.utils.user import get_user_fullname
 
@@ -567,9 +587,9 @@ class User(Document):
 		) or None
 
 		if custom_template:
-			from frappe.email.doctype.email_template.email_template import get_email_template
-
-			email_template = get_email_template(custom_template, args, sender=sender)
+			email_template = frappe.get_doc("Email Template", custom_template).get_formatted_email(
+				args, sender=sender
+			)
 			subject = email_template.get("subject")
 			content = email_template.get("message")
 
@@ -581,6 +601,7 @@ class User(Document):
 			content=content if custom_template else None,
 			args=args,
 			with_container=True,
+			wrapper=wrapper,
 			delayed=(not now) if now is not None else self.flags.delay_emails,
 			retry=3,
 			redact_message_after_send=True,
@@ -617,7 +638,7 @@ class User(Document):
 		# delete notification settings
 		frappe.delete_doc("Notification Settings", self.name, ignore_permissions=True)
 
-		if self.get("allow_in_mentions"):
+		if self.get("allowed_in_mentions"):
 			frappe.cache.delete_key("users_for_mentions")
 
 		frappe.cache.delete_key("enabled_users")
@@ -634,6 +655,18 @@ class User(Document):
 
 		# Delete user's List Filters
 		frappe.db.delete("List Filter", {"for_user": self.name})
+
+		# Delete the user's own navigation arrangements: their sidebar layers and their dock.
+		# Delete whole documents rather than rows, because they carry a child table and deleting
+		# the document is what clears the cached set of layers. The site layer, with `user` blank,
+		# is not a personal preference and stays.
+		#
+		# Both doctypes are in `ignore_links_on_delete`, so nothing would have complained about
+		# rows left behind, and `Dock` is uniquely keyed on `user`, so a leftover layer would be
+		# handed to the next user created with the same id.
+		for doctype in ("Custom Sidebar", "Dock"):
+			for name in frappe.get_all(doctype, filters={"user": self.name}, pluck="name"):
+				frappe.delete_doc(doctype, name, ignore_permissions=True, force=True)
 
 		# Remove user from Note's Seen By table
 		seen_notes = frappe.get_all("Note", filters=[["Note Seen By", "user", "=", self.name]], pluck="name")
@@ -689,6 +722,8 @@ class User(Document):
 
 		# set email
 		frappe.db.set_value("User", new_name, "email", new_name)
+
+		get_controller("Workspace").rename_private_workspaces(old_name, new_name)
 
 		clear_sessions(user=old_name, force=True)
 		clear_sessions(user=new_name, force=True)
@@ -871,8 +906,7 @@ class User(Document):
 			indicator="orange",
 			primary_action={
 				"label": _("Add Roles"),
-				"client_action": "frappe.set_route",
-				"args": ["Form", self.doctype, self.name],
+				"client_action": "frappe.scroll_to_user_roles_field",
 			},
 		)
 
@@ -917,13 +951,7 @@ def get_all_roles():
 
 
 @frappe.whitelist()
-def get_roles(arg=None):
-	"""get roles for a user"""
-	return frappe.get_roles(frappe.form_dict.get("uid", frappe.session.user))
-
-
-@frappe.whitelist()
-def get_perm_info(role):
+def get_perm_info(role: str):
 	"""get permission info"""
 	from frappe.permissions import get_all_perms
 
@@ -966,6 +994,12 @@ def update_password(
 
 	user_doc.validate_reset_password()
 
+	frappe.db.set_value("User", user, "last_password_reset_date", today())
+	frappe.db.set_value("User", user, "reset_password_key", "")
+
+	if key and should_run_2fa(user):
+		return "/login"
+
 	# get redirect url from cache
 	redirect_to = frappe.cache.hget("redirect_after_login", user)
 	if redirect_to:
@@ -974,9 +1008,6 @@ def update_password(
 
 	frappe.local.login_manager.login_as(user)
 
-	frappe.db.set_value("User", user, "last_password_reset_date", today())
-	frappe.db.set_value("User", user, "reset_password_key", "")
-
 	if user_doc.user_type == "System User":
 		return get_default_path() or "/desk"
 	else:
@@ -984,7 +1015,9 @@ def update_password(
 
 
 @frappe.whitelist(allow_guest=True)
-def test_password_strength(new_password: str, key=None, old_password=None, user_data: tuple | None = None):
+def test_password_strength(
+	new_password: str, key: str | None = None, old_password: str | None = None, user_data: tuple | None = None
+):
 	from frappe.utils.password_strength import test_password_strength as _test_password_strength
 
 	if key is not None or old_password is not None:
@@ -1090,7 +1123,7 @@ def reset_user_data(user):
 
 
 @frappe.whitelist(methods=["POST"])
-def verify_password(password):
+def verify_password(password: str):
 	frappe.local.login_manager.check_password(frappe.session.user, password)
 
 
@@ -1177,9 +1210,18 @@ def reset_password(user: str) -> None:
 	)
 
 
+@frappe.whitelist(methods=["POST"])
+def change_password(user: str, new_password: str, logout_all_sessions: int = 1) -> None:
+	user_doc: User = frappe.get_doc("User", user)
+	user_doc.check_permission("write")
+	user_doc.new_password = new_password
+	user_doc.logout_all_sessions = logout_all_sessions
+	user_doc.save()
+
+
 @frappe.whitelist()
 @frappe.validate_and_sanitize_search_inputs
-def user_query(doctype, txt, searchfield, start, page_len, filters):
+def user_query(doctype: str, txt: str, searchfield: str, start: int, page_len: int, filters: dict[str, Any]):
 	doctype = "User"
 
 	list_filters = {
@@ -1291,20 +1333,19 @@ def notify_admin_access_to_system_manager(login_manager=None):
 		and login_manager.user == "Administrator"
 		and frappe.local.conf.notify_admin_access_to_system_manager
 	):
-		site = '<a href="{0}" target="_blank">{0}</a>'.format(frappe.local.request.host_url)
-		date_and_time = "<b>{}</b>".format(format_datetime(now_datetime(), format_string="medium"))
+		date_and_time = format_datetime(now_datetime(), format_string="medium")
 		ip_address = frappe.local.request_ip
-
-		access_message = _("Administrator accessed {0} on {1} via IP Address {2}.").format(
-			site, date_and_time, ip_address
-		)
 
 		frappe.sendmail(
 			recipients=get_system_managers(),
 			subject=_("Administrator Logged In"),
 			template="administrator_logged_in",
-			args={"access_message": access_message},
-			header=["Access Notification", "orange"],
+			args={
+				"date_and_time": date_and_time,
+				"ip_address": ip_address,
+			},
+			with_container=True,
+			wrapper="templates/emails/auth_email.html",
 		)
 
 
@@ -1448,7 +1489,7 @@ def generate_keys(user: str):
 
 
 @frappe.whitelist()
-def switch_theme(theme):
+def switch_theme(theme: str):
 	if theme in ["Dark", "Light", "Automatic"]:
 		frappe.db.set_value("User", frappe.session.user, "desk_theme", theme)
 

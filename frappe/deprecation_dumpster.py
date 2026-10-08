@@ -724,7 +724,10 @@ def get_tests_CompatFrappeTestCase():
 
 			def _sql_with_count(*args, **kwargs):
 				ret = orig_sql(*args, **kwargs)
-				queries.append(args[0].last_query)
+				# `last_query` is a lazy wrapper on every driver except MariaDB
+				# (LazyMogrify on SQLite, LazyDecode on Postgres); the join below
+				# needs real strings. Matches IntegrationTestCase.assertQueryCount.
+				queries.append(str(args[0].last_query))
 				return ret
 
 			try:
@@ -775,7 +778,8 @@ def get_tests_CompatFrappeTestCase():
 				yield
 				self.assertLessEqual(rows_read, count, msg="Queries read more rows than expected")
 			finally:
-				frappe.db.sql = orig_sql
+				# assigning the original back would keep `sql` on the instance and hide patches on the class
+				vars(frappe.db).pop("sql", None)
 
 		@classmethod
 		def enable_safe_exec(cls) -> None:

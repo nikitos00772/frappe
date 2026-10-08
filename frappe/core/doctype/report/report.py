@@ -112,7 +112,11 @@ class Report(Document):
 		delete_custom_role("report", self.name)
 
 	def clear_cache(self):
+		from frappe.desk.doctype.sidebar.sidebar import clear_computed_base_for
+
 		self.update_report_cache()
+		# a module with no `Sidebar` has its sidebar computed from reports like this one
+		clear_computed_base_for(self)
 		return super().clear_cache()
 
 	def update_report_cache(self):
@@ -216,6 +220,9 @@ class Report(Document):
 		return res
 
 	def get_module_method(self, method):
+		if method not in ("execute", "execute_snapshot_report", "get_xlsx_styles"):
+			raise Exception("Unknown report method")
+
 		module = self.module or frappe.db.get_value("DocType", self.ref_doctype, "module")
 		method_path = get_report_module_dotted_path(module, self.name) + "." + method
 		return frappe.get_attr(method_path)

@@ -59,18 +59,7 @@ def report_error(status_code):
 			_link_error_with_message_log(error_log, exc_value, frappe.message_log)
 			frappe.local.response.errors = [error_log]
 
-	try:
-		response = build_response("json")
-	except TypeError:
-		error_keys = ("exception", "exc_type", "errors")
-		frappe.local.response = frappe._dict(
-			{key: frappe.local.response[key] for key in error_keys if key in frappe.local.response}
-		)
-		try:
-			response = build_response("json")
-		except TypeError:
-			response = Response(orjson.dumps({"exc_type": exc_type.__name__}), mimetype="application/json")
-
+	response = build_response("json")
 	response.status_code = status_code
 
 	return response
@@ -314,15 +303,30 @@ def download_private_file(path: str) -> Response:
 		raise Forbidden(_("You don't have permission to access this file"))
 
 	make_access_log(doctype="File", document=file.name, file_type=os.path.splitext(path)[-1][1:])
-	return send_private_file(path.split("/private", 1)[1])
+	return send_private_file(path.split("/private", 1)[1], filename=file.file_name)
 
 
-FORCE_DOWNLOAD_EXTENSIONS = (".svg", ".html", ".htm", ".xml")
+FORCE_DOWNLOAD_EXTENSIONS = (
+	".svg",
+	".svgz",
+	".html",
+	".htm",
+	".xhtml",
+	".xht",
+	".shtml",
+	".shtm",
+	".mhtml",
+	".mht",
+	".xml",
+	".xsl",
+	".xslt",
+	".swf",
+)
 
 
-def send_private_file(path: str) -> Response:
+def send_private_file(path: str, filename: str | None = None) -> Response:
 	path = os.path.join(frappe.local.conf.get("private_path", "private"), path.strip("/"))
-	filename = os.path.basename(path)
+	filename = filename or os.path.basename(path)
 
 	extension = os.path.splitext(path)[1]
 	as_attachment = extension.lower() in FORCE_DOWNLOAD_EXTENSIONS
@@ -348,7 +352,7 @@ def send_private_file(path: str) -> Response:
 			environ=frappe.local.request.environ,
 			conditional=True,
 			as_attachment=as_attachment,
-			download_name=filename if as_attachment else None,
+			download_name=filename,
 		)
 
 	return response

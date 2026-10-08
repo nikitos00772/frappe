@@ -31,6 +31,13 @@ class Dashboard(Document):
 		module: DF.Link | None
 	# end: auto-generated types
 
+	def clear_cache(self):
+		from frappe.desk.doctype.sidebar.sidebar import clear_computed_base_for
+
+		# a module with no `Sidebar` has its sidebar computed from dashboards like this one
+		clear_computed_base_for(self)
+		return super().clear_cache()
+
 	def on_update(self):
 		if self.is_default:
 			# make all other dashboards non-default
@@ -85,7 +92,7 @@ def get_permission_query_conditions(user):
 
 
 @frappe.whitelist()
-def get_permitted_charts(dashboard_name):
+def get_permitted_charts(dashboard_name: str):
 	permitted_charts = []
 	dashboard = frappe.get_doc("Dashboard", dashboard_name)
 	for chart in dashboard.charts:

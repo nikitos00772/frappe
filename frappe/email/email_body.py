@@ -415,6 +415,7 @@ def get_formatted_html(
 	with_container=False,
 	raw_html=False,
 	add_css=True,
+	wrapper="templates/emails/standard.html",
 ):
 	email_account = email_account or EmailAccount.find_outgoing(match_by_email=sender)
 
@@ -438,7 +439,7 @@ def get_formatted_html(
 				"footer": get_footer(email_account, footer),
 			}
 		)
-		rendered_email = frappe.get_template("templates/emails/standard.html").render(params)
+		rendered_email = frappe.get_template(wrapper).render(params)
 
 	html = scrub_urls(rendered_email)
 
@@ -449,7 +450,14 @@ def get_formatted_html(
 
 
 @frappe.whitelist()
-def get_email_html(template, args, subject, header=None, with_container=False):
+def get_email_html(
+	template: str,
+	args: str,
+	subject: str,
+	header: str | list | None = None,
+	with_container: str | int | bool = False,
+):
+	frappe.only_for("System Manager")
 	import json
 
 	with_container = cint(with_container)
@@ -634,15 +642,21 @@ def get_filecontent_from_path(path):
 
 	if path.startswith("assets/"):
 		# from public folder
+		base_path = os.path.abspath("assets")
 		full_path = os.path.abspath(path)
 	elif path.startswith("files/"):
 		# public file
-		full_path = frappe.get_site_path("public", path)
+		base_path = os.path.abspath(frappe.get_site_path("public", "files"))
+		full_path = os.path.abspath(frappe.get_site_path("public", path))
 	elif path.startswith("private/files/"):
 		# private file
-		full_path = frappe.get_site_path(path)
+		base_path = os.path.abspath(frappe.get_site_path("private", "files"))
+		full_path = os.path.abspath(frappe.get_site_path(path))
 	else:
-		full_path = path
+		return None
+
+	if os.path.commonpath((base_path, full_path)) != base_path:
+		return None
 
 	if os.path.exists(full_path):
 		with open(full_path, "rb") as f:

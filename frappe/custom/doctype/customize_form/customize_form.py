@@ -715,7 +715,7 @@ def is_standard_or_system_generated_field(df):
 
 
 @frappe.whitelist()
-def get_link_filters_from_doc_without_customisations(doctype, fieldname):
+def get_link_filters_from_doc_without_customisations(doctype: str, fieldname: str):
 	"""Get the filters of a link field from a doc without customisations
 	In backend the customisations are not applied.
 	Customisations are applied in the client side.
@@ -793,6 +793,7 @@ docfield_properties = {
 	"print_hide": "Check",
 	"print_hide_if_no_value": "Check",
 	"report_hide": "Check",
+	"in_import_template": "Check",
 	"allow_on_submit": "Check",
 	"translatable": "Check",
 	"mandatory_depends_on": "Data",

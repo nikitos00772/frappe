@@ -84,7 +84,7 @@ def _apply_date_field_filter_conversion(value, operator: str, doctype: str, fiel
 		elif isinstance(value, datetime.datetime):
 			return value.date()
 
-	except AttributeError, TypeError, KeyError:
+	except (AttributeError, TypeError, KeyError):
 		pass
 
 	return value
@@ -101,7 +101,7 @@ def _apply_datetime_field_filter_conversion(between_values: tuple | list, doctyp
 	Returns:
 		Tuple with dates expanded to datetime ranges for Datetime fields
 	"""
-	from frappe.model.db_query import _convert_type_for_between_filters
+	from frappe.utils.data import convert_type_for_between_filters
 
 	# Extract field name
 	field_name = field
@@ -121,9 +121,9 @@ def _apply_datetime_field_filter_conversion(between_values: tuple | list, doctyp
 
 	from_val, to_val = between_values
 
-	# Convert to datetime using db_query helper (handles strings, dates, datetimes)
-	from_val = _convert_type_for_between_filters(from_val, set_time=datetime.time())
-	to_val = _convert_type_for_between_filters(to_val, set_time=datetime.time(23, 59, 59, 999999))
+	# Convert to datetime using shared helper (handles strings, dates, datetimes)
+	from_val = convert_type_for_between_filters(from_val, set_time=datetime.time())
+	to_val = convert_type_for_between_filters(to_val, set_time=datetime.time(23, 59, 59, 999999))
 
 	return (from_val, to_val)
 
@@ -271,6 +271,9 @@ class Engine:
 			self.doctype = table
 			self.table = qb.DocType(table)
 
+		if frappe.flags.get("ignore_user_permissions_for_doctype") == self.doctype:
+			self.ignore_user_permissions = True
+
 		if self.apply_permissions:
 			self.check_select_permission()
 			self.permission_doctype = parent_doctype or self.doctype
@@ -334,9 +337,11 @@ class Engine:
 
 		self.add_permission_conditions()
 
-		# Store metadata for masked field processing during execution
-		self.query._doctype = self.doctype
-		self.query._fields_list = getattr(self, "fields", [])
+		if self.apply_permissions:
+			# Store metadata for masked field processing during execution.
+			self.query._doctype = self.doctype
+			self.query._parent_doctype = self.parent_doctype
+			self.query._fields_list = getattr(self, "fields", [])
 
 		self.query.immutable = True
 		return self.query
@@ -575,6 +580,13 @@ class Engine:
 			frappe.throw(_("Document cannot be used as a filter value"))
 		_operator = operator
 
+		# _assign and _liked_by store a JSON array of user ids, so `=`/`!=` never match a
+		# single member; treat them as `like`/`not like` against the serialized value.
+		if isinstance(field, str) and field in ("_assign", "_liked_by") and _operator in ("=", "!="):
+			_operator = "like" if _operator == "=" else "not like"
+			if isinstance(_value, str) and _value:
+				_value = f"%{_value}%"
+
 		if _operator.lower() in ("timespan", "previous", "next"):
 			from frappe.model.db_query import get_date_range
 
@@ -608,8 +620,8 @@ class Engine:
 		if self.db_query_compat and _value is None and _operator.casefold() in ("in", "not in"):
 			_value = ("",)
 
-		if _operator in NESTED_SET_OPERATORS:
-			hierarchy = _operator
+		if _operator.casefold() in NESTED_SET_OPERATORS:
+			hierarchy = _operator.casefold()
 			docname = _value
 
 			# Use the original field name string for get_field if _field was converted
@@ -662,7 +674,7 @@ class Engine:
 				else:
 					try:
 						fallback_value = int(fallback_sql)
-					except ValueError, TypeError:
+					except (ValueError, TypeError):
 						fallback_value = fallback_sql
 
 				return operator_fn(_field, ValueWrapper(fallback_value))
@@ -691,7 +703,7 @@ class Engine:
 				else:
 					try:
 						fallback_value = int(fallback_sql)
-					except ValueError, TypeError:
+					except (ValueError, TypeError):
 						fallback_value = fallback_sql
 
 				if fallback_value == _value:
@@ -1033,7 +1045,7 @@ class Engine:
 			# for select permission on parent doctype, allow all permlevel 0 fields in filters
 			cache_key = (doctype, None, "_filterable_select")
 			if cache_key not in self.permitted_fields_cache:
-				if doctype in PERMITTED_CORE_DOCTYPES:
+				if doctype in PERMITTED_CORE_DOCTYPES and doctype != "User":
 					# no restrictions - return all valid columns
 					self.permitted_fields_cache[cache_key] = set(meta.get_valid_columns())
 				else:
@@ -1041,11 +1053,22 @@ class Engine:
 					for df in meta.get_fieldnames_with_value(with_field_meta=True, with_virtual_fields=False):
 						if df.permlevel == 0:
 							permlevel_0_fields.add(df.fieldname)
+					if doctype == "User":
+						# user_type is permlevel 1 but not itself sensitive, and the built-in
+						# Link-field search (user.user_query) filters by it for every select-only caller
+						permlevel_0_fields.add("user_type")
 					self.permitted_fields_cache[cache_key] = permlevel_0_fields
 			return self.permitted_fields_cache[cache_key]
 		else:
 			# for read permission, use standard permitted fields
-			return self._get_cached_permitted_fields(doctype, parenttype, permission_type)
+			permitted_fields = self._get_cached_permitted_fields(doctype, parenttype, permission_type)
+			if doctype == "User" and "user_type" not in permitted_fields:
+				# user_type is permlevel 1 but not itself sensitive, and the built-in
+				# Link-field search (user.user_query) filters by it for every caller.
+				# Allow it for filtering only - do not mutate the cached set, since that
+				# is also used to check permission for selecting/returning fields.
+				return permitted_fields | {"user_type"}
+			return permitted_fields
 
 	def parse_string_field(self, field: str):
 		"""
@@ -1739,6 +1762,14 @@ class Engine:
 
 			quote_char = "`" if self.is_mariadb else '"'
 			for c in criteria_list:
+				if self.is_mariadb:
+					# pypika's ValueWrapper only escapes quote characters, not backslashes.
+					# MariaDB's default sql_mode treats `\` as an escape char inside string
+					# literals, so an unescaped trailing backslash lets a filter value break
+					# out of its quotes.
+					for node in c.nodes_():
+						if isinstance(node, ValueWrapper) and isinstance(node.value, str):
+							node.value = node.value.replace("\\", "\\\\")
 				conditions.append(c.get_sql(with_namespace=True, quote_char=quote_char))
 		finally:
 			self.apply_permissions = original_apply_permissions
@@ -2050,10 +2081,13 @@ class LinkTableField(DynamicTableField):
 		table = frappe.qb.DocType(self.doctype)
 		main_table = frappe.qb.DocType(self.parent_doctype)
 		if not query.is_joined(table):
-			query = query.left_join(table).on(table.name == getattr(main_table, self.link_fieldname))
+			clause = table.name == getattr(main_table, self.link_fieldname)
+
 			if engine and engine.apply_permissions:
 				if condition := engine.get_permission_conditions(self.doctype, table):
-					query = query.where(condition)
+					clause &= condition
+
+			query = query.left_join(table).on(clause)
 
 		return query
 

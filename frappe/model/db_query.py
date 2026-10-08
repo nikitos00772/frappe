@@ -7,7 +7,7 @@ import datetime
 import json
 import re
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from functools import cached_property, lru_cache
 
 import sqlparse
@@ -15,7 +15,6 @@ from sqlparse import tokens
 from sqlparse.sql import Function, Parenthesis, Statement
 
 import frappe
-import frappe.defaults
 import frappe.permissions
 import frappe.share
 from frappe import _
@@ -24,7 +23,6 @@ from frappe.database.utils import DefaultOrderBy, FallBackDateTimeStr, NestedSet
 from frappe.model import OPTIONAL_FIELDS, get_permitted_fields
 from frappe.model.meta import get_table_columns
 from frappe.model.utils import is_virtual_doctype
-from frappe.model.utils.mask import mask_field_value
 from frappe.model.utils.user_settings import get_user_settings, update_user_settings
 from frappe.query_builder.utils import Column
 from frappe.types import Filters, FilterSignature, FilterTuple
@@ -36,7 +34,9 @@ from frappe.utils import (
 	get_time,
 	get_timespan_date_range,
 )
-from frappe.utils.data import DateTimeLikeObject, get_datetime, getdate, sbool
+from frappe.utils.data import convert_type_for_between_filters, sbool
+
+_convert_type_for_between_filters = convert_type_for_between_filters  # bw compatibility
 
 
 @lru_cache(maxsize=128)
@@ -275,7 +275,7 @@ class DatabaseQuery:
 
 		meta = self.get_meta(self.doctype)
 
-		return meta.get_masked_fields()
+		return meta.get_masked_fields(parenttype=self.parent_doctype)
 
 	def build_and_run(self):
 		args = self.prepare_args()
@@ -816,6 +816,13 @@ from {tables}
 		df = meta.get("fields", {"fieldname": f.fieldname})
 		df = df[0] if df else None
 
+		# _assign and _liked_by store a JSON array of user ids, so `=`/`!=` never match a
+		# single member; treat them as `like`/`not like` against the serialized value.
+		if f.fieldname in ("_assign", "_liked_by") and f.operator in ("=", "!="):
+			f.operator = "like" if f.operator == "=" else "not like"
+			if isinstance(f.value, str) and f.value:
+				f.value = f"%{f.value}%"
+
 		# primary key is never nullable, modified is usually indexed by default and always present
 		can_be_null = f.fieldname not in ("name", "modified", "creation")
 
@@ -1180,7 +1187,7 @@ from {tables}
 		return " and ".join(conditions) if conditions else ""
 
 	def set_order_by(self, args):
-		if self.order_by and self.order_by != "KEEP_DEFAULT_ORDERING":
+		if self.order_by and self.order_by != DefaultOrderBy:
 			args.order_by = self.order_by
 		else:
 			args.order_by = ""
@@ -1398,8 +1405,8 @@ def get_between_date_filter(value, df=None):
 
 	# if filter value is date but fieldtype is datetime:
 	if fieldtype == "Datetime":
-		from_date = _convert_type_for_between_filters(from_date, set_time=datetime.time())
-		to_date = _convert_type_for_between_filters(to_date, set_time=datetime.time(23, 59, 59, 999999))
+		from_date = convert_type_for_between_filters(from_date, set_time=datetime.time())
+		to_date = convert_type_for_between_filters(to_date, set_time=datetime.time(23, 59, 59, 999999))
 
 	# If filter value is already datetime, do nothing.
 	if fieldtype == "Datetime":
@@ -1408,23 +1415,6 @@ def get_between_date_filter(value, df=None):
 		cond = f"'{frappe.db.format_date(from_date)}' AND '{frappe.db.format_date(to_date)}'"
 
 	return cond
-
-
-def _convert_type_for_between_filters(
-	value: DateTimeLikeObject, set_time: datetime.time
-) -> datetime.datetime:
-	if isinstance(value, str):
-		if " " in value.strip():
-			value = get_datetime(value)
-		else:
-			value = getdate(value)
-
-	if isinstance(value, datetime.datetime):
-		return value
-	elif isinstance(value, datetime.date):
-		return datetime.datetime.combine(value, set_time)
-
-	return value
 
 
 def get_additional_filter_field(additional_filters_config, f, value):

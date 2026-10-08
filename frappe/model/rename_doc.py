@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 	from frappe.model.meta import Meta
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def update_document_title(
 	*,
 	doctype: str,
@@ -343,6 +343,9 @@ def validate_rename(
 	save_point=False,
 	old_doc: Document | None = None,
 ) -> str:
+	if meta.issingle:
+		frappe.throw(_("Single DocTypes cannot be renamed"))
+
 	# using for update so that it gets locked and someone else cannot edit it while this rename is going on!
 	if save_point:
 		_SAVE_POINT = f"validate_rename_{frappe.generate_hash(length=8)}"
